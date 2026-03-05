@@ -12,29 +12,23 @@ This script quantizes OpenVLA-7B to 4-bit using SINQ
 and saves it to Google Drive for LIBERO benchmarking
 """
 
-from google.colab import drive
-drive.mount('/content/drive')
-
-# Create directory for quantized model
-import os
-quantized_model_path = "/content/drive/MyDrive/openvla_4bit_sinq"
-os.makedirs(quantized_model_path, exist_ok=True)
-print(f"Quantized model will be saved to: {quantized_model_path}")
-
 !pip install transformers==4.38.2
 !pip install torch torchvision accelerate
 !pip install git+https://github.com/huawei-csl/SINQ.git  # Install SINQ from source
 !pip install safetensors
 !pip install timm==0.9.16
 
-# #Grab Layer data
+from google.colab import drive
+drive.mount('/content/drive')
+
+# #Grab Layer data -- DON'T NEED TO RUN THIS CELL ANYMORE
 
 # from transformers import AutoModelForVision2Seq
 
-# model_name = "openvla/openvla-7b-finetuned-libero-spatial"
+# vla_model = "openvla/openvla-7b-finetuned-libero-spatial"
 
 # model = AutoModelForVision2Seq.from_pretrained(
-#     model_name,
+#     vla_model,
 #     torch_dtype="auto",
 #     device_map="cpu",
 #     trust_remote_code=True
@@ -46,6 +40,8 @@ print(f"Quantized model will be saved to: {quantized_model_path}")
 #         print(name)
 
 import torch
+import os
+import json
 import warnings
 warnings.filterwarnings('ignore')
 
@@ -56,14 +52,53 @@ from transformers import AutoTokenizer, AutoModelForVision2Seq
 from sinq.sinqlinear import sinq_base_quant_config
 from sinq.patch_model import AutoSINQHFModel
 
-MODEL_NAME = "openvla/openvla-7b-finetuned-libero-spatial"
+#PATHS
+vla_model = "openvla/openvla-7b-finetuned-libero-spatial"
+
+# Create directory for quantized model
+SAVE_DIR = "/content/drive/MyDrive/openvlaa/technical/openvla_4bit_sinq"
+os.makedirs(SAVE_DIR, exist_ok=True)
+print(f"Quantized model will be saved to: {SAVE_DIR}")
+
+"""#Need to patch get_ignore_layers to only quantize the llama layers
+VLA structure:
+- vision_backbone.*
+- projector.*
+- language_model.model.layers.*
+- language_model.model.embed_tokens
+- language_model.lm_head
+"""
+
+import sinq.utils
+from sinq.utils import get_ignore_layers
+
+def get_ignore_layers_openvla(model):
+    ignore_layers = []
+
+    for name, module in model.named_modules():
+
+        # Only allow quantization for LLaMA transformer blocks
+        if name.startswith("language_model.model.layers"):
+            continue
+
+        # Everything else should be ignored
+        ignore_layers.append(name)
+
+    return ignore_layers
+
+#Replace the attribute get_ignore_layers in the sinq.utils module
+#with my function get_ignore_layers_openvla
+
+sinq.utils.get_ignore_layers = get_ignore_layers_openvla
+
+"""#Quantize using SINQ"""
 
 print("Loading tokenizer...")
-tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME, trust_remote_code=True)
+tokenizer = AutoTokenizer.from_pretrained(vla_model, trust_remote_code=True)
 
-print("Loading model (this requires transformers 4.38.2)...")
+print("Loading model")
 model = AutoModelForVision2Seq.from_pretrained(
-    MODEL_NAME,
+    vla_model,
     torch_dtype=torch.bfloat16,
     device_map="auto",
     trust_remote_code=True
@@ -82,24 +117,19 @@ quant_cfg = sinq_base_quant_config(
 print("Quantization config created:")
 print(json.dumps(quant_cfg, indent=2))
 
-# ==============================================
-#  Quantization Configuration
-# ==============================================
+# # ==============================================
+# #  Quantization Configuration
+# # ==============================================
 
-# Create SINQ quantization config (standalone version)
-quant_cfg = BaseQuantizeConfig(
-    nbits=4,            # 4-bit quantization
-    group_size=64,      # Group size for quantization
-    tiling_mode="1D",   # Tiling strategy
-    method="sinq",      # Quantization method
-    # Specify modules to exclude from quantization
-    modules_to_exclude = [
-      "lm_head",
-      "embed_tokens",
-      "vision_backbone",
-      "vision_backbone.model",
-      "projector"]
-)
+# # Create SINQ quantization config
+# quant_cfg = BaseQuantizeConfig(
+#     nbits=4,            # 4-bit quantization
+#     group_size=64,      # Group size for quantization
+#     tiling_mode="1D",   # Tiling strategy
+#     method="sinq",      # Quantization method
+# )
+
+print("Quantization config created:")
 
 # Apply quantization
 qmodel = AutoSINQHFModel.quantize_model(
@@ -112,7 +142,51 @@ qmodel = AutoSINQHFModel.quantize_model(
 
 print("✓ Model quantized with SINQ (standalone mode)")
 
+# Save using SINQ's standalone save function
+
+print(f"\nSaving quantized model to {SAVE_DIR}...")
+
+AutoSINQHFModel.save_quantized_safetensors(
+    qmodel,
+    tokenizer,
+    SAVE_DIR,
+    verbose=True,
+    max_shard_size="5GB"
+)
+
+print("✓ Model saved successfully!")
+
 print("\nVerifying quantization...")
+
+quantized_layers = []
+
+for name, module in qmodel.named_modules():
+    if "SINQ" in module.__class__.__name__:
+        quantized_layers.append(name)
+
+print("Total quantized layers:", len(quantized_layers))
+
+for l in quantized_layers[:30]:
+    print(l)
+
+"""
+Note:
+the expected output:
+language_model.model.layers.0.self_attn.q_proj
+language_model.model.layers.0.self_attn.k_proj
+language_model.model.layers.0.self_attn.v_proj
+language_model.model.layers.0.self_attn.o_proj
+language_model.model.layers.0.mlp.gate_proj
+language_model.model.layers.0.mlp.up_proj
+language_model.model.layers.0.mlp.down_proj
+...
+
+we shouldn't see:
+vision_backbone
+projector
+embed_tokens
+lm_head
+"""
 
 # Check memory reduction
 def calculate_memory(model):
@@ -136,39 +210,6 @@ print(f"Total parameters: {total_params:,}")
 print(f"Quantized memory: {memory_gb:.2f} GB")
 print(f"Baseline (FP16): {baseline_gb:.2f} GB")
 print(f"Memory reduction: {(1 - memory_gb / baseline_gb) * 100:.1f}%")
-
-# Save using SINQ's standalone save function
-save_dir = "openvla-7b-libero-spatial-4bit-sinq"
-
-print(f"\nSaving quantized model to {save_dir}...")
-AutoSINQHFModel.save_quantized_safetensors(
-    qmodel,
-    tokenizer,
-    save_dir,
-    verbose=True,
-    max_shard_size="5GB"
-)
-
-print("✓ Model saved successfully!")
-
-# Configuration
-MODEL_NAME = "openvla/openvla-7b-finetuned-libero-spatial"
-QUANTIZATION_CONFIG = SinqConfig(
-    nbits=4,                    # 4-bit quantization
-    group_size=64,              # Group size for quantization
-    tiling_mode="1D",         # Tiling strategy
-    method="sinq",            # Quantization method
-    modules_to_not_convert=[
-    "lm_head",
-    "embed_tokens",
-    "vision_backbone",
-    "vision_backbone.model",
-    "projector"]
-)
-
-print("🎯 Starting OpenVLA 4-bit quantization with SINQ...")
-print(f"Model: {MODEL_NAME}")
-print(f"Quantization: {QUANTIZATION_CONFIG.nbits}-bit, group_size={QUANTIZATION_CONFIG.group_size}")
 
 # ==============================================
 # Memory Usage Statistics
